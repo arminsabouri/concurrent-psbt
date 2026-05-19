@@ -6,8 +6,8 @@
 set -euo pipefail
 
 usage() {
-  cat >&2 <<'EOF'
-Usage: scrub-commit-history [options] [-r REVSET]... [REVSET]...
+  cat >&2 <<EOF
+Usage: ${0##/*} [options] [-r REVSET]... [REVSET]...
 
 Sequential ordering (default: --reverse):
   --forward      first to last (CI: verify whole history)
@@ -17,6 +17,9 @@ Sequential ordering (default: --reverse):
 Options:
   -r REVSET           jj revset to scrub (repeatable, same as positional)
   --everything        scrub all branches, not just HEAD
+  --check NAME        flake check for fast pre-check (default: quick)
+  --parallel          batch builds for parallel execution
+  -L                  print build logs
   --no-flake-checks   skip flake build checks (message-only mode)
   -h, --help          show this help
 
@@ -29,6 +32,10 @@ order=reverse
 run_flake_checks=true
 revsets=()
 everything=false
+check_name=quick
+mode=sequential
+nix_build_args=()
+stderr_redirect=/dev/null
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,6 +43,15 @@ while [ $# -gt 0 ]; do
   --reverse) order=reverse ;;
   --bisect) order=bisect ;;
   --everything) everything=true ;;
+  --parallel) mode=parallel ;;
+  --check)
+    shift
+    check_name="$1"
+    ;;
+  -L)
+    nix_build_args+=("-L")
+    stderr_redirect="/dev/stderr"
+    ;;
   --no-flake-checks) run_flake_checks=false ;;
   -r)
     shift
@@ -49,6 +65,13 @@ done
 
 repo_root=$(git rev-parse --show-toplevel)
 system=$(nix eval --offline --raw --impure --expr builtins.currentSystem)
+
+# Select build command: use nom (nix-output-monitor) when on a tty, else nix build
+if [ -t 1 ] && command -v nom >/dev/null 2>&1; then
+  build_cmd=(nom build)
+else
+  build_cmd=(nix build)
+fi
 
 # Resolve revsets to git commit IDs via jj
 if [ ${#revsets[@]} -gt 0 ]; then
@@ -98,8 +121,18 @@ esac
 # Format a commit for display, preferring jj's change ID
 fmt_commit() {
   jj log --ignore-working-copy --no-graph -r "$1" \
-    -T 'change_id.shortest() ++ " " ++ commit_id.shortest() ++ " " ++ description.first_line()' \
+    -T 'change_id.shortest(7) ++ " " ++ commit_id.shortest(7) ++ " " ++ description.first_line()' \
     2>/dev/null || git log -1 --format='%h %s' "$1"
+}
+
+# Format a rerun hint for a failed commit using jj change ID
+fmt_rerun_hint() {
+  local change_id
+  change_id=$(jj log --ignore-working-copy --no-graph -r "$1" \
+    -T 'change_id.shortest(7)' 2>/dev/null || true)
+  if [ -n "$change_id" ]; then
+    echo "    rerun: nix run .#scrub-commit-history -- -r $change_id"
+  fi
 }
 
 # Phase 1: check commit messages for unresolved work-item markers
@@ -147,42 +180,142 @@ if git cat-file -e "$tip_hash:.gitignore" 2>/dev/null; then
   fi
 fi
 
-# Phase 2: nix flake check on each commit (skipped with --no-flake-checks)
+# Phase 1c: quick pre-check (fast feedback optimization)
+if [ "$run_flake_checks" = true ]; then
+  if [ "$mode" = parallel ]; then
+    quick_targets=()
+    for idx in "${ordered[@]}"; do
+      hash=${linear[$idx]}
+      git log -1 --format='%B' "$hash" | grep -qP '\[EXPECT-FAIL: [^\]]+\]' && continue
+      git cat-file -e "$hash:flake.nix" 2>/dev/null || continue
+      flakeref="git+file://$repo_root?rev=$hash"
+      target="$flakeref#checks.$system.$check_name"
+      if nix eval --no-update-lock-file "$target" --apply 'x: true' >/dev/null 2>/dev/null; then
+        quick_targets+=("$target")
+      fi
+    done
+    if [ ${#quick_targets[@]} -gt 0 ]; then
+      echo "Quick pre-check: building ${#quick_targets[@]} $check_name targets in parallel..."
+      if "${build_cmd[@]}" --no-update-lock-file "${nix_build_args[@]}" "${quick_targets[@]}" --no-link; then
+        echo "  ✓ quick pre-check passed"
+      else
+        echo "  ✗ quick pre-check had failures, checking sequentially..."
+        mode=sequential
+      fi
+    fi
+  fi
+  if [ "$mode" = sequential ]; then
+    echo "Quick pre-check: running $check_name checks ($order)..."
+    for idx in "${ordered[@]}"; do
+      hash=${linear[$idx]}
+      git log -1 --format='%B' "$hash" | grep -qP '\[EXPECT-FAIL: [^\]]+\]' && continue
+      git cat-file -e "$hash:flake.nix" 2>/dev/null || continue
+      flakeref="git+file://$repo_root?rev=$hash"
+      target="$flakeref#checks.$system.$check_name"
+      if nix eval --no-update-lock-file "$target" --apply 'x: true' >/dev/null 2>/dev/null; then
+        if ! nix build --no-update-lock-file "${nix_build_args[@]}" "$target" --no-link 2>"$stderr_redirect"; then
+          echo "  ✗ $(fmt_commit "$hash") ($check_name failed)"
+        fi
+      fi
+    done
+  fi
+fi
+
+# Phase 2: full flake checks (skipped with --no-flake-checks)
 build_failed=()
 if [ "$run_flake_checks" = true ]; then
-  echo "Verifying $total commits ($order)..."
-  for idx in "${ordered[@]}"; do
-    hash=${linear[$idx]}
-
-    # Skip commits without a flake
-    if ! git cat-file -e "$hash:flake.nix" 2>/dev/null; then
-      echo "  - $(fmt_commit "$hash") (no flake.nix)"
-      continue
+  if [ "$mode" = parallel ]; then
+    echo "Full flake check: collecting targets for parallel build..."
+    flake_targets=()
+    expect_fail_indices=()
+    skip_indices=()
+    no_checks_indices=()
+    for idx in "${ordered[@]}"; do
+      hash=${linear[$idx]}
+      if ! git cat-file -e "$hash:flake.nix" 2>/dev/null; then
+        skip_indices+=("$idx")
+        continue
+      fi
+      if git log -1 --format='%B' "$hash" | grep -qP '\[EXPECT-FAIL: [^\]]+\]'; then
+        expect_fail_indices+=("$idx")
+        continue
+      fi
+      flakeref="git+file://$repo_root?rev=$hash"
+      n_before=${#flake_targets[@]}
+      while IFS= read -r attr; do
+        flake_targets+=("$flakeref#checks.$system.$attr")
+      done < <(nix eval --no-update-lock-file "$flakeref#checks.$system" --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)' --raw 2>/dev/null || true)
+      if [ ${#flake_targets[@]} -eq "$n_before" ]; then
+        no_checks_indices+=("$idx")
+      fi
+    done
+    for idx in "${skip_indices[@]}"; do
+      echo "  - $(fmt_commit "${linear[$idx]}") (no flake.nix)"
+    done
+    if [ ${#flake_targets[@]} -gt 0 ]; then
+      n_commits=$((${#ordered[@]} - ${#skip_indices[@]} - ${#expect_fail_indices[@]} - ${#no_checks_indices[@]}))
+      echo "Full flake check: building ${#flake_targets[@]} targets across $n_commits commits..."
+      if "${build_cmd[@]}" --no-update-lock-file "${nix_build_args[@]}" "${flake_targets[@]}" --no-link; then
+        echo "  ✓ all flake checks passed"
+      else
+        echo "  ✗ parallel flake check had failures, falling back to sequential..."
+        mode=sequential
+      fi
     fi
-
-    flakeref="git+file://$repo_root?rev=$hash"
-
-    # EXPECT-FAIL: verify the named check fails
-    expect_fail=$(git log -1 --format='%B' "$hash" | grep -oP '(?<=\[EXPECT-FAIL: )[^\]]+' || true)
-    if [ -n "$expect_fail" ]; then
+    # EXPECT-FAIL always checked individually
+    for idx in "${expect_fail_indices[@]}"; do
+      hash=${linear[$idx]}
+      flakeref="git+file://$repo_root?rev=$hash"
+      expect_fail=$(git log -1 --format='%B' "$hash" | grep -oP '(?<=\[EXPECT-FAIL: )[^\]]+' || true)
       named_target="$flakeref#checks.$system.$expect_fail"
-      if nix build --no-update-lock-file "$named_target" --no-link 2>/dev/null; then
+      if nix build --no-update-lock-file "${nix_build_args[@]}" "$named_target" --no-link 2>"$stderr_redirect"; then
         echo "  ✗ $(fmt_commit "$hash") (EXPECT-FAIL: $expect_fail unexpectedly passed)"
         build_failed+=("$hash")
       else
         echo "  ✓ $(fmt_commit "$hash") (EXPECT-FAIL: $expect_fail correctly fails)"
       fi
-      continue
-    fi
+    done
+    # Commits with no check attrs — verify flake evaluates
+    for idx in "${no_checks_indices[@]}"; do
+      hash=${linear[$idx]}
+      flakeref="git+file://$repo_root?rev=$hash"
+      if nix flake check --no-update-lock-file "${nix_build_args[@]}" "$flakeref" 2>"$stderr_redirect"; then
+        echo "  ✓ $(fmt_commit "$hash") (flake check only)"
+      else
+        echo "  ✗ $(fmt_commit "$hash")"
+        build_failed+=("$hash")
+      fi
+    done
+  fi
 
-    # Full flake check
-    if nix flake check --no-update-lock-file "$flakeref" 2>/dev/null; then
-      echo "  ✓ $(fmt_commit "$hash")"
-    else
-      echo "  ✗ $(fmt_commit "$hash")"
-      build_failed+=("$hash")
-    fi
-  done
+  if [ "$mode" = sequential ]; then
+    echo "Full flake check: verifying $total commits ($order)..."
+    for idx in "${ordered[@]}"; do
+      hash=${linear[$idx]}
+      if ! git cat-file -e "$hash:flake.nix" 2>/dev/null; then
+        echo "  - $(fmt_commit "$hash") (no flake.nix)"
+        continue
+      fi
+      flakeref="git+file://$repo_root?rev=$hash"
+      expect_fail=$(git log -1 --format='%B' "$hash" | grep -oP '(?<=\[EXPECT-FAIL: )[^\]]+' || true)
+      if [ -n "$expect_fail" ]; then
+        named_target="$flakeref#checks.$system.$expect_fail"
+        if nix build --no-update-lock-file "${nix_build_args[@]}" "$named_target" --no-link 2>"$stderr_redirect"; then
+          echo "  ✗ $(fmt_commit "$hash") (EXPECT-FAIL: $expect_fail unexpectedly passed)"
+          build_failed+=("$hash")
+        else
+          echo "  ✓ $(fmt_commit "$hash") (EXPECT-FAIL: $expect_fail correctly fails)"
+        fi
+        continue
+      fi
+      if nix flake check --no-update-lock-file "${nix_build_args[@]}" "$flakeref" 2>"$stderr_redirect"; then
+        echo "  ✓ $(fmt_commit "$hash")"
+      else
+        echo "  ✗ $(fmt_commit "$hash")"
+        build_failed+=("$hash")
+      fi
+    done
+  fi
 fi
 
 # Summary
@@ -194,6 +327,7 @@ else
   echo "${#failures[@]} failure(s):"
   for h in "${build_failed[@]}"; do
     echo "  build: $(fmt_commit "$h")"
+    fmt_rerun_hint "$h"
   done
   for h in "${msg_failed[@]}"; do
     echo "  message: $(fmt_commit "$h")"
