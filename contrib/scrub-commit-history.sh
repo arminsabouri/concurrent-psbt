@@ -2,18 +2,12 @@
 # scrub-commit-history — verify commit hygiene across history
 #
 # Walks commit history and checks each commit for unresolved work-item
-# markers in messages (TODO, FIXME, WIP, fixup!, squash!).
-#
-# Subsequent commits in the scrubber sequence add:
-# - Full nix flake check verification with EXPECT-FAIL support
-# - --everything mode for all branches
-# - Gitignore monotonicity checking
-# - Quick pre-check optimization with --parallel batching
+# markers in messages and optionally runs nix flake check on each.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: scrub-commit-history [options] [REVSET]...
+Usage: scrub-commit-history [options] [-r REVSET]... [REVSET]...
 
 Sequential ordering (default: --reverse):
   --forward      first to last (CI: verify whole history)
@@ -22,6 +16,7 @@ Sequential ordering (default: --reverse):
 
 Options:
   -r REVSET           jj revset to scrub (repeatable, same as positional)
+  --no-flake-checks   skip flake build checks (message-only mode)
   -h, --help          show this help
 
 Range defaults: all commits reachable from @
@@ -30,6 +25,7 @@ EOF
 }
 
 order=reverse
+run_flake_checks=true
 revsets=()
 
 while [ $# -gt 0 ]; do
@@ -37,6 +33,7 @@ while [ $# -gt 0 ]; do
   --forward) order=forward ;;
   --reverse) order=reverse ;;
   --bisect) order=bisect ;;
+  --no-flake-checks) run_flake_checks=false ;;
   -r)
     shift
     revsets+=("$1")
@@ -47,6 +44,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+repo_root=$(git rev-parse --show-toplevel)
+system=$(nix eval --offline --raw --impure --expr builtins.currentSystem)
+
 # Resolve revsets to git commit IDs via jj
 if [ ${#revsets[@]} -gt 0 ]; then
   jj_args=(log --ignore-working-copy --no-graph -T 'commit_id ++ "\n"')
@@ -55,7 +55,6 @@ if [ ${#revsets[@]} -gt 0 ]; then
   done
   mapfile -t linear < <(jj "${jj_args[@]}" 2>/dev/null | grep -vE '^$|^0{40}$')
 else
-  # Default: all commits reachable from working copy
   mapfile -t linear < <(jj log --ignore-working-copy --no-graph -r '::@' -T 'commit_id ++ "\n"' 2>/dev/null | grep -vE '^$|^0{40}$')
 fi
 
@@ -66,7 +65,6 @@ if [ "$total" -eq 0 ]; then
 fi
 
 # Build index ordering for traversal
-# The linear array is in topo order; we reorder indices for the chosen strategy
 case "$order" in
 forward)
   ordered=()
@@ -77,7 +75,6 @@ reverse)
   for ((i = total - 1; i >= 0; i--)); do ordered+=("$i"); done
   ;;
 bisect)
-  # BFS on midpoints — finds failures in O(log n) for sparse breakage
   ordered=()
   queue=("0 $((total - 1))")
   while [ ${#queue[@]} -gt 0 ]; do
@@ -101,7 +98,7 @@ fmt_commit() {
     2>/dev/null || git log -1 --format='%h %s' "$1"
 }
 
-# Check each commit message for unresolved work-item markers
+# Phase 1: check commit messages for unresolved work-item markers
 msg_failed=()
 echo "Checking commit messages..."
 for idx in "${ordered[@]}"; do
@@ -117,12 +114,54 @@ else
   echo "  all clean"
 fi
 
+# Phase 2: nix flake check on each commit (skipped with --no-flake-checks)
+build_failed=()
+if [ "$run_flake_checks" = true ]; then
+  echo "Verifying $total commits ($order)..."
+  for idx in "${ordered[@]}"; do
+    hash=${linear[$idx]}
+
+    # Skip commits without a flake
+    if ! git cat-file -e "$hash:flake.nix" 2>/dev/null; then
+      echo "  - $(fmt_commit "$hash") (no flake.nix)"
+      continue
+    fi
+
+    flakeref="git+file://$repo_root?rev=$hash"
+
+    # EXPECT-FAIL: verify the named check fails
+    expect_fail=$(git log -1 --format='%B' "$hash" | grep -oP '(?<=\[EXPECT-FAIL: )[^\]]+' || true)
+    if [ -n "$expect_fail" ]; then
+      named_target="$flakeref#checks.$system.$expect_fail"
+      if nix build --no-update-lock-file "$named_target" --no-link 2>/dev/null; then
+        echo "  ✗ $(fmt_commit "$hash") (EXPECT-FAIL: $expect_fail unexpectedly passed)"
+        build_failed+=("$hash")
+      else
+        echo "  ✓ $(fmt_commit "$hash") (EXPECT-FAIL: $expect_fail correctly fails)"
+      fi
+      continue
+    fi
+
+    # Full flake check
+    if nix flake check --no-update-lock-file "$flakeref" 2>/dev/null; then
+      echo "  ✓ $(fmt_commit "$hash")"
+    else
+      echo "  ✗ $(fmt_commit "$hash")"
+      build_failed+=("$hash")
+    fi
+  done
+fi
+
 # Summary
-if [ "${#msg_failed[@]}" -eq 0 ]; then
+failures=("${msg_failed[@]}" "${build_failed[@]}")
+if [ "${#failures[@]}" -eq 0 ]; then
   echo "All $total commits passed."
 else
   echo
-  echo "${#msg_failed[@]} failure(s):"
+  echo "${#failures[@]} failure(s):"
+  for h in "${build_failed[@]}"; do
+    echo "  build: $(fmt_commit "$h")"
+  done
   for h in "${msg_failed[@]}"; do
     echo "  message: $(fmt_commit "$h")"
   done
