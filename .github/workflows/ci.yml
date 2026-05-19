@@ -13,3 +13,20 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix flake check
+
+  scrub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Scrub commit history
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            nix run --no-update-lock-file .#scrub-commit-history -- --forward \
+              -r '${{ github.event.pull_request.base.sha }}..${{ github.sha }}'
+          else
+            nix run --no-update-lock-file .#scrub-commit-history -- --forward
+          fi
