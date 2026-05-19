@@ -118,6 +118,35 @@ else
   echo "  all clean"
 fi
 
+# Phase 1b: gitignore monotonicity check
+gitignore_failed=()
+tip_hash=${linear[$((total - 1))]}
+if git cat-file -e "$tip_hash:.gitignore" 2>/dev/null; then
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "$tmpdir"' EXIT
+  git show "$tip_hash:.gitignore" >"$tmpdir/.gitignore"
+  git init -q "$tmpdir/repo"
+  cp "$tmpdir/.gitignore" "$tmpdir/repo/.gitignore"
+
+  echo "Checking gitignore monotonicity..."
+  for idx in "${ordered[@]}"; do
+    hash=${linear[$idx]}
+    leaked=$(git ls-tree -r --name-only "$hash" 2>/dev/null |
+      git -C "$tmpdir/repo" check-ignore --stdin 2>/dev/null || true)
+    if [ -n "$leaked" ]; then
+      first=$(echo "$leaked" | head -1)
+      count=$(echo "$leaked" | wc -l)
+      echo "  ✗ $(fmt_commit "$hash") — $count file(s) leaked, e.g. $first"
+      gitignore_failed+=("$hash")
+    fi
+  done
+  if [ "${#gitignore_failed[@]}" -eq 0 ]; then
+    echo "  all clean"
+  else
+    echo "${#gitignore_failed[@]} commit(s) have gitignore leaks"
+  fi
+fi
+
 # Phase 2: nix flake check on each commit (skipped with --no-flake-checks)
 build_failed=()
 if [ "$run_flake_checks" = true ]; then
@@ -157,7 +186,7 @@ if [ "$run_flake_checks" = true ]; then
 fi
 
 # Summary
-failures=("${msg_failed[@]}" "${build_failed[@]}")
+failures=("${msg_failed[@]}" "${gitignore_failed[@]}" "${build_failed[@]}")
 if [ "${#failures[@]}" -eq 0 ]; then
   echo "All $total commits passed."
 else
@@ -168,6 +197,9 @@ else
   done
   for h in "${msg_failed[@]}"; do
     echo "  message: $(fmt_commit "$h")"
+  done
+  for h in "${gitignore_failed[@]}"; do
+    echo "  gitignore: $(fmt_commit "$h")"
   done
   exit 1
 fi
