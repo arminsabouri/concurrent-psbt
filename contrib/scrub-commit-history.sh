@@ -16,10 +16,11 @@ Sequential ordering (default: --reverse):
 
 Options:
   -r REVSET           jj revset to scrub (repeatable, same as positional)
+  --everything        scrub all branches, not just HEAD
   --no-flake-checks   skip flake build checks (message-only mode)
   -h, --help          show this help
 
-Range defaults: all commits reachable from @
+Range defaults: all commits reachable from @ (or all branches with --everything)
 EOF
   exit 1
 }
@@ -27,12 +28,14 @@ EOF
 order=reverse
 run_flake_checks=true
 revsets=()
+everything=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
   --forward) order=forward ;;
   --reverse) order=reverse ;;
   --bisect) order=bisect ;;
+  --everything) everything=true ;;
   --no-flake-checks) run_flake_checks=false ;;
   -r)
     shift
@@ -54,10 +57,11 @@ if [ ${#revsets[@]} -gt 0 ]; then
     jj_args+=(-r "$rs")
   done
   mapfile -t linear < <(jj "${jj_args[@]}" 2>/dev/null | grep -vE '^$|^0{40}$')
+elif [ "$everything" = true ]; then
+  mapfile -t linear < <(jj log --ignore-working-copy --no-graph -r 'all() ~ root()' -T 'commit_id ++ "\n"' 2>/dev/null | grep -vE '^$|^0{40}$')
 else
   mapfile -t linear < <(jj log --ignore-working-copy --no-graph -r '::@' -T 'commit_id ++ "\n"' 2>/dev/null | grep -vE '^$|^0{40}$')
 fi
-
 total=${#linear[@]}
 if [ "$total" -eq 0 ]; then
   echo "No commits in range."
